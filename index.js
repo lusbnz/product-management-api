@@ -762,7 +762,11 @@ app.delete('/api/products/:id', (req, res) => {
 });
 
 // Start server
-app.listen(PORT, () => {
-  console.log(`Server is running on http://localhost:${PORT}`);
-  console.log(`Swagger Docs are available on http://localhost:${PORT}/api-docs`);
-});
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(PORT, () => {
+    console.log(`Server is running on http://localhost:${PORT}`);
+    console.log(`Swagger Docs are available on http://localhost:${PORT}/api-docs`);
+  });
+}
+
+module.exports = app;
