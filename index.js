@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID } = require('crypto');
 const swaggerUi = require('swagger-ui-express');
 const swaggerJsdoc = require('swagger-jsdoc');
 const jwt = require('jsonwebtoken');
@@ -816,7 +816,7 @@ app.post('/api/products/:id/reviews', (req, res) => {
     if (!product.reviews) product.reviews = [];
     
     const newReview = {
-      id: uuidv4(),
+      id: randomUUID(),
       user,
       rating: Number(rating),
       comment,
@@ -900,7 +900,7 @@ app.post('/api/products/:id/restore', (req, res) => {
 app.post('/api/products', (req, res) => {
   const products = readData();
   const newProduct = {
-    id: uuidv4(),
+    id: randomUUID(),
     ...req.body,
     createdAt: new Date().toISOString(),
     reviews: []
