@@ -97,6 +97,35 @@ const authenticateToken = (req, res, next) => {
 /**
  * @swagger
  * tags:
+ *   name: Test
+ *   description: System health check
+ */
+
+/**
+ * @swagger
+ * /api/test:
+ *   get:
+ *     summary: Health check endpoint
+ *     tags: [Test]
+ *     security: []
+ *     responses:
+ *       200:
+ *         description: API is working
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 message:
+ *                   type: string
+ */
+app.get('/api/test', (req, res) => {
+  res.json({ message: 'API is working properly' });
+});
+
+/**
+ * @swagger
+ * tags:
  *   name: Auth
  *   description: Authentication APIs
  */
