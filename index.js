@@ -5,10 +5,17 @@ const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const swaggerUi = require('swagger-ui-express');
 const swaggerJsdoc = require('swagger-jsdoc');
+const jwt = require('jsonwebtoken');
+
+const SECRET_KEY = process.env.SECRET_KEY || 'supersecretkey123';
+const REFRESH_SECRET_KEY = process.env.REFRESH_SECRET_KEY || 'superrefreshsecretkey123';
 
 const app = express();
 const PORT = process.env.PORT || 3002;
 const dataFilePath = path.join(__dirname, 'data.json');
+const usersFilePath = path.join(__dirname, 'users.json');
+
+let refreshTokens = [];
 
 app.use(cors());
 app.use(express.json());
@@ -27,12 +34,241 @@ const swaggerOptions = {
         url: `http://localhost:${PORT}`,
       },
     ],
+    components: {
+      securitySchemes: {
+        bearerAuth: {
+          type: 'http',
+          scheme: 'bearer',
+          bearerFormat: 'JWT',
+        },
+      },
+    },
+    security: [
+      {
+        bearerAuth: [],
+      },
+    ],
   },
   apis: [path.join(__dirname, 'index.js')],
 };
 
 const specs = swaggerJsdoc(swaggerOptions);
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(specs));
+
+// Helper function to read users
+const readUsers = () => {
+  try {
+    if (!fs.existsSync(usersFilePath)) {
+      const defaultUsers = [{ id: 1, username: 'admin', password: 'password123' }];
+      fs.writeFileSync(usersFilePath, JSON.stringify(defaultUsers, null, 2));
+      return defaultUsers;
+    }
+    const data = fs.readFileSync(usersFilePath, 'utf8');
+    return JSON.parse(data);
+  } catch (error) {
+    console.error('Error reading users:', error);
+    return [];
+  }
+};
+
+// Helper function to write users
+const writeUsers = (users) => {
+  try {
+    fs.writeFileSync(usersFilePath, JSON.stringify(users, null, 2));
+  } catch (error) {
+    console.error('Error writing users:', error);
+  }
+};
+
+// Middleware to authenticate token
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) return res.status(401).json({ message: 'Access token required' });
+
+  jwt.verify(token, SECRET_KEY, (err, user) => {
+    if (err) return res.status(403).json({ message: 'Invalid or expired token' });
+    req.user = user;
+    next();
+  });
+};
+
+/**
+ * @swagger
+ * tags:
+ *   name: Auth
+ *   description: Authentication APIs
+ */
+
+/**
+ * @swagger
+ * /api/auth/login:
+ *   post:
+ *     summary: Login to get access token
+ *     tags: [Auth]
+ *     security: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [username, password]
+ *             properties:
+ *               username:
+ *                 type: string
+ *               password:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Successful login
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 accessToken:
+ *                   type: string
+ *                 refreshToken:
+ *                   type: string
+ *       401:
+ *         description: Invalid credentials
+ */
+app.post('/api/auth/login', (req, res) => {
+  const { username, password } = req.body;
+  const users = readUsers();
+  const user = users.find(u => u.username === username && u.password === password);
+
+  if (user) {
+    const accessToken = jwt.sign({ username: user.username }, SECRET_KEY, { expiresIn: '15m' });
+    const refreshToken = jwt.sign({ username: user.username }, REFRESH_SECRET_KEY, { expiresIn: '7d' });
+    refreshTokens.push(refreshToken);
+    res.json({ accessToken, refreshToken });
+  } else {
+    res.status(401).json({ message: 'Invalid credentials' });
+  }
+});
+
+/**
+ * @swagger
+ * /api/auth/refresh:
+ *   post:
+ *     summary: Get a new access token using a refresh token
+ *     tags: [Auth]
+ *     security: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [token]
+ *             properties:
+ *               token:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: New access token generated
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 accessToken:
+ *                   type: string
+ *                 refreshToken:
+ *                   type: string
+ *       401:
+ *         description: Refresh token required
+ *       403:
+ *         description: Invalid or expired refresh token
+ */
+app.post('/api/auth/refresh', (req, res) => {
+  const { token } = req.body;
+  if (!token) return res.status(401).json({ message: 'Refresh token required' });
+  if (!refreshTokens.includes(token)) return res.status(403).json({ message: 'Invalid refresh token' });
+
+  jwt.verify(token, REFRESH_SECRET_KEY, (err, user) => {
+    if (err) return res.status(403).json({ message: 'Invalid or expired refresh token' });
+
+    refreshTokens = refreshTokens.filter(t => t !== token);
+    const newAccessToken = jwt.sign({ username: user.username }, SECRET_KEY, { expiresIn: '15m' });
+    const newRefreshToken = jwt.sign({ username: user.username }, REFRESH_SECRET_KEY, { expiresIn: '7d' });
+    refreshTokens.push(newRefreshToken);
+
+    res.json({ accessToken: newAccessToken, refreshToken: newRefreshToken });
+  });
+});
+
+/**
+ * @swagger
+ * /api/auth/logout:
+ *   post:
+ *     summary: Logout user and invalidate refresh token
+ *     tags: [Auth]
+ *     security: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [token]
+ *             properties:
+ *               token:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Logged out successfully
+ */
+app.post('/api/auth/logout', (req, res) => {
+  const { token } = req.body;
+  refreshTokens = refreshTokens.filter(t => t !== token);
+  res.json({ message: 'Logged out successfully' });
+});
+
+/**
+ * @swagger
+ * /api/auth/change-password:
+ *   post:
+ *     summary: Change user password
+ *     tags: [Auth]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [oldPassword, newPassword]
+ *             properties:
+ *               oldPassword:
+ *                 type: string
+ *               newPassword:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Password changed successfully
+ *       400:
+ *         description: Incorrect old password
+ */
+app.post('/api/auth/change-password', authenticateToken, (req, res) => {
+  const { oldPassword, newPassword } = req.body;
+  const username = req.user.username;
+  const users = readUsers();
+  const userIndex = users.findIndex(u => u.username === username);
+
+  if (userIndex !== -1 && users[userIndex].password === oldPassword) {
+    users[userIndex].password = newPassword;
+    writeUsers(users);
+    res.json({ message: 'Password changed successfully' });
+  } else {
+    res.status(400).json({ message: 'Incorrect old password' });
+  }
+});
+
+// Protect all /api/products routes
+app.use('/api/products', authenticateToken);
 
 // Helper function to read data
 const readData = () => {
