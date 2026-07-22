@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
@@ -6,19 +7,127 @@ const { randomUUID } = require('crypto');
 const swaggerUi = require('swagger-ui-express');
 const swaggerJsdoc = require('swagger-jsdoc');
 const jwt = require('jsonwebtoken');
+const { Pool } = require('pg');
 
 const SECRET_KEY = process.env.SECRET_KEY || 'supersecretkey123';
 const REFRESH_SECRET_KEY = process.env.REFRESH_SECRET_KEY || 'superrefreshsecretkey123';
 
 const app = express();
 const PORT = process.env.PORT || 3002;
-const dataFilePath = path.join(__dirname, 'data.json');
-const usersFilePath = path.join(__dirname, 'users.json');
 
-let refreshTokens = [];
+const pool = new Pool({
+  connectionString: process.env.POSTGRES_URL || process.env.DATABASE_URL || 'postgres://localhost:5432/productdb',
+  ssl: (process.env.POSTGRES_URL || process.env.DATABASE_URL) ? { rejectUnauthorized: false } : false
+});
 
 app.use(cors());
 app.use(express.json());
+
+// Middleware to authenticate token
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) return res.status(401).json({ message: 'Access token required' });
+
+  jwt.verify(token, SECRET_KEY, (err, user) => {
+    if (err) return res.status(401).json({ message: 'Invalid or expired token' });
+    req.user = user;
+    next();
+  });
+};
+
+/**
+ * @swagger
+ * /api/setup:
+ *   get:
+ *     summary: Initialize database tables and seed data
+ *     tags: [Test]
+ *     security: []
+ *     responses:
+ *       200:
+ *         description: Setup successful
+ */
+app.get('/api/setup', async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(255) UNIQUE NOT NULL,
+        password VARCHAR(255) NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS products (
+        id UUID PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        "desc" TEXT,
+        price NUMERIC NOT NULL,
+        tags TEXT[],
+        status VARCHAR(50),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        deleted_at TIMESTAMP,
+        is_active BOOLEAN,
+        rating NUMERIC,
+        metadata JSONB
+      );
+      CREATE TABLE IF NOT EXISTS reviews (
+        id UUID PRIMARY KEY,
+        product_id UUID REFERENCES products(id),
+        "user" VARCHAR(255) NOT NULL,
+        rating NUMERIC NOT NULL,
+        comment TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE IF NOT EXISTS refresh_tokens (
+        token TEXT PRIMARY KEY,
+        username VARCHAR(255) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    // Seed users
+    const usersCount = await pool.query('SELECT COUNT(*) FROM users');
+    if (parseInt(usersCount.rows[0].count) === 0) {
+      const usersFilePath = path.join(__dirname, 'users.json');
+      if (fs.existsSync(usersFilePath)) {
+        const users = JSON.parse(fs.readFileSync(usersFilePath, 'utf8'));
+        for (const user of users) {
+          await pool.query('INSERT INTO users (username, password) VALUES ($1, $2) ON CONFLICT (username) DO NOTHING', [user.username, user.password]);
+        }
+      }
+    }
+
+    // Seed products
+    const productsCount = await pool.query('SELECT COUNT(*) FROM products');
+    if (parseInt(productsCount.rows[0].count) === 0) {
+      const dataFilePath = path.join(__dirname, 'data.json');
+      if (fs.existsSync(dataFilePath)) {
+        const products = JSON.parse(fs.readFileSync(dataFilePath, 'utf8'));
+        for (const p of products) {
+          await pool.query(`
+            INSERT INTO products (id, name, "desc", price, tags, status, created_at, deleted_at, is_active, rating, metadata)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            ON CONFLICT (id) DO NOTHING
+          `, [p.id, p.name, p.desc, p.price, p.tags || [], p.status, p.createdAt || new Date(), p.deletedAt || null, p.isActive, p.rating, p.metadata || {}]);
+          
+          if (p.reviews && p.reviews.length > 0) {
+            for (const r of p.reviews) {
+              await pool.query(`
+                INSERT INTO reviews (id, product_id, "user", rating, comment, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (id) DO NOTHING
+              `, [r.id || randomUUID(), p.id, r.user, r.rating, r.comment, r.createdAt || new Date()]);
+            }
+          }
+        }
+      }
+    }
+
+    res.json({ message: 'Database setup and seeded successfully' });
+  } catch (error) {
+    console.error('Setup error:', error);
+    res.status(500).json({ message: 'Database setup failed', error: error.message });
+  }
+});
 
 // Swagger definition
 const swaggerOptions = {
@@ -56,126 +165,23 @@ const specs = swaggerJsdoc(swaggerOptions);
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(specs));
 
 // Helper function to read users
-const readUsers = () => {
-  try {
-    if (!fs.existsSync(usersFilePath)) {
-      const defaultUsers = [{ id: 1, username: 'admin', password: 'password123' }];
-      fs.writeFileSync(usersFilePath, JSON.stringify(defaultUsers, null, 2));
-      return defaultUsers;
-    }
-    const data = fs.readFileSync(usersFilePath, 'utf8');
-    return JSON.parse(data);
-  } catch (error) {
-    console.error('Error reading users:', error);
-    return [];
-  }
-};
-
-// Helper function to write users
-const writeUsers = (users) => {
-  try {
-    fs.writeFileSync(usersFilePath, JSON.stringify(users, null, 2));
-  } catch (error) {
-    console.error('Error writing users:', error);
-  }
-};
-
-// Middleware to authenticate token
-const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-
-  if (!token) return res.status(401).json({ message: 'Access token required' });
-
-  jwt.verify(token, SECRET_KEY, (err, user) => {
-    if (err) return res.status(401).json({ message: 'Invalid or expired token' });
-    req.user = user;
-    next();
-  });
-};
-
-/**
- * @swagger
- * tags:
- *   name: Test
- *   description: System health check
- */
-
-/**
- * @swagger
- * /api/test:
- *   get:
- *     summary: Health check endpoint
- *     tags: [Test]
- *     security: []
- *     responses:
- *       200:
- *         description: API is working
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 message:
- *                   type: string
- */
-app.get('/api/test', (req, res) => {
-  res.json({ message: 'API is working properly' });
-});
-
-/**
- * @swagger
- * tags:
- *   name: Auth
- *   description: Authentication APIs
- */
-
-/**
- * @swagger
- * /api/auth/login:
- *   post:
- *     summary: Login to get access token
- *     tags: [Auth]
- *     security: []
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             required: [username, password]
- *             properties:
- *               username:
- *                 type: string
- *               password:
- *                 type: string
- *     responses:
- *       200:
- *         description: Successful login
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 accessToken:
- *                   type: string
- *                 refreshToken:
- *                   type: string
- *       401:
- *         description: Invalid credentials
- */
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   const { username, password } = req.body;
-  const users = readUsers();
-  const user = users.find(u => u.username === username && u.password === password);
-
-  if (user) {
-    const accessToken = jwt.sign({ username: user.username }, SECRET_KEY, { expiresIn: '1d' });
-    const refreshToken = jwt.sign({ username: user.username }, REFRESH_SECRET_KEY, { expiresIn: '7d' });
-    refreshTokens.push(refreshToken);
-    res.json({ accessToken, refreshToken });
-  } else {
-    res.status(401).json({ message: 'Invalid credentials' });
+  try {
+    const result = await pool.query('SELECT * FROM users WHERE username = $1 AND password = $2', [username, password]);
+    if (result.rows.length > 0) {
+      const user = result.rows[0];
+      const accessToken = jwt.sign({ username: user.username }, SECRET_KEY, { expiresIn: '1d' });
+      const refreshToken = jwt.sign({ username: user.username }, REFRESH_SECRET_KEY, { expiresIn: '7d' });
+      
+      await pool.query('INSERT INTO refresh_tokens (token, username) VALUES ($1, $2)', [refreshToken, user.username]);
+      
+      res.json({ accessToken, refreshToken });
+    } else {
+      res.status(401).json({ message: 'Invalid credentials' });
+    }
+  } catch (error) {
+    res.status(500).json({ message: 'Internal server error', error: error.message });
   }
 });
 
@@ -213,21 +219,29 @@ app.post('/api/auth/login', (req, res) => {
  *       403:
  *         description: Invalid or expired refresh token
  */
-app.post('/api/auth/refresh', (req, res) => {
+app.post('/api/auth/refresh', async (req, res) => {
   const { token } = req.body;
   if (!token) return res.status(401).json({ message: 'Refresh token required' });
-  if (!refreshTokens.includes(token)) return res.status(403).json({ message: 'Invalid refresh token' });
+  
+  try {
+    const result = await pool.query('SELECT * FROM refresh_tokens WHERE token = $1', [token]);
+    if (result.rows.length === 0) return res.status(403).json({ message: 'Invalid refresh token' });
 
-  jwt.verify(token, REFRESH_SECRET_KEY, (err, user) => {
-    if (err) return res.status(403).json({ message: 'Invalid or expired refresh token' });
+    jwt.verify(token, REFRESH_SECRET_KEY, async (err, user) => {
+      if (err) return res.status(403).json({ message: 'Invalid or expired refresh token' });
 
-    refreshTokens = refreshTokens.filter(t => t !== token);
-    const newAccessToken = jwt.sign({ username: user.username }, SECRET_KEY, { expiresIn: '1d' });
-    const newRefreshToken = jwt.sign({ username: user.username }, REFRESH_SECRET_KEY, { expiresIn: '7d' });
-    refreshTokens.push(newRefreshToken);
+      await pool.query('DELETE FROM refresh_tokens WHERE token = $1', [token]);
+      
+      const newAccessToken = jwt.sign({ username: user.username }, SECRET_KEY, { expiresIn: '1d' });
+      const newRefreshToken = jwt.sign({ username: user.username }, REFRESH_SECRET_KEY, { expiresIn: '7d' });
+      
+      await pool.query('INSERT INTO refresh_tokens (token, username) VALUES ($1, $2)', [newRefreshToken, user.username]);
 
-    res.json({ accessToken: newAccessToken, refreshToken: newRefreshToken });
-  });
+      res.json({ accessToken: newAccessToken, refreshToken: newRefreshToken });
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Internal server error', error: error.message });
+  }
 });
 
 /**
@@ -251,10 +265,14 @@ app.post('/api/auth/refresh', (req, res) => {
  *       200:
  *         description: Logged out successfully
  */
-app.post('/api/auth/logout', (req, res) => {
+app.post('/api/auth/logout', async (req, res) => {
   const { token } = req.body;
-  refreshTokens = refreshTokens.filter(t => t !== token);
-  res.json({ message: 'Logged out successfully' });
+  try {
+    await pool.query('DELETE FROM refresh_tokens WHERE token = $1', [token]);
+    res.json({ message: 'Logged out successfully' });
+  } catch (error) {
+    res.status(500).json({ message: 'Internal server error', error: error.message });
+  }
 });
 
 /**
@@ -281,142 +299,58 @@ app.post('/api/auth/logout', (req, res) => {
  *       400:
  *         description: Incorrect old password
  */
-app.post('/api/auth/change-password', authenticateToken, (req, res) => {
+app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
   const { oldPassword, newPassword } = req.body;
   const username = req.user.username;
-  const users = readUsers();
-  const userIndex = users.findIndex(u => u.username === username);
-
-  if (userIndex !== -1 && users[userIndex].password === oldPassword) {
-    users[userIndex].password = newPassword;
-    writeUsers(users);
-    res.json({ message: 'Password changed successfully' });
-  } else {
-    res.status(400).json({ message: 'Incorrect old password' });
+  
+  try {
+    const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+    if (result.rows.length > 0 && result.rows[0].password === oldPassword) {
+      await pool.query('UPDATE users SET password = $1 WHERE username = $2', [newPassword, username]);
+      res.json({ message: 'Password changed successfully' });
+    } else {
+      res.status(400).json({ message: 'Incorrect old password' });
+    }
+  } catch (error) {
+    res.status(500).json({ message: 'Internal server error', error: error.message });
   }
 });
 
 // Protect all /api/products routes
 app.use('/api/products', authenticateToken);
 
-// Helper function to read data
-const readData = () => {
+app.get('/api/products/stats', async (req, res) => {
   try {
-    const data = fs.readFileSync(dataFilePath, 'utf8');
-    return JSON.parse(data);
+    const totalRes = await pool.query('SELECT COUNT(*) FROM products WHERE deleted_at IS NULL');
+    const outOfStockRes = await pool.query("SELECT COUNT(*) FROM products WHERE deleted_at IS NULL AND status = 'Out of Stock'");
+    const avgRatingRes = await pool.query('SELECT AVG(rating) as avg_rating FROM products WHERE deleted_at IS NULL');
+    
+    const total = parseInt(totalRes.rows[0].count);
+    const outOfStock = parseInt(outOfStockRes.rows[0].count);
+    const averageRating = avgRatingRes.rows[0].avg_rating ? parseFloat(avgRatingRes.rows[0].avg_rating).toFixed(1) : 0;
+    
+    const brandCountsRes = await pool.query(`
+      SELECT metadata->>'brand' as brand, COUNT(*) 
+      FROM products 
+      WHERE deleted_at IS NULL 
+      GROUP BY metadata->>'brand'
+    `);
+    
+    const brandCounts = {};
+    brandCountsRes.rows.forEach(row => {
+      const brand = row.brand || 'Unknown';
+      brandCounts[brand] = parseInt(row.count);
+    });
+
+    res.json({
+      totalProducts: total,
+      outOfStock,
+      averageRating: parseFloat(averageRating),
+      brandCounts
+    });
   } catch (error) {
-    console.error('Error reading data:', error);
-    return [];
+    res.status(500).json({ message: 'Internal server error', error: error.message });
   }
-};
-
-// Helper function to write data
-const writeData = (data) => {
-  try {
-    fs.writeFileSync(dataFilePath, JSON.stringify(data, null, 2));
-  } catch (error) {
-    console.error('Error writing data:', error);
-  }
-};
-
-/**
- * @swagger
- * components:
- *   schemas:
- *     Review:
- *       type: object
- *       properties:
- *         id:
- *           type: string
- *         user:
- *           type: string
- *         rating:
- *           type: number
- *         comment:
- *           type: string
- *         createdAt:
- *           type: string
- *           format: date-time
- *     Product:
- *       type: object
- *       properties:
- *         id:
- *           type: string
- *         name:
- *           type: string
- *         desc:
- *           type: string
- *         price:
- *           type: number
- *         tags:
- *           type: array
- *           items:
- *             type: string
- *         status:
- *           type: string
- *         createdAt:
- *           type: string
- *           format: date-time
- *         deletedAt:
- *           type: string
- *           format: date-time
- *         isActive:
- *           type: boolean
- *         rating:
- *           type: number
- *         metadata:
- *           type: object
- *         reviews:
- *           type: array
- *           items:
- *             $ref: '#/components/schemas/Review'
- */
-
-/**
- * @swagger
- * /api/products/stats:
- *   get:
- *     summary: Get dashboard statistics (excludes deleted)
- *     tags: [Dashboard]
- *     responses:
- *       200:
- *         description: Stats object
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 totalProducts:
- *                   type: integer
- *                 outOfStock:
- *                   type: integer
- *                 averageRating:
- *                   type: number
- *                 brandCounts:
- *                   type: object
- *                   additionalProperties:
- *                     type: integer
- */
-app.get('/api/products/stats', (req, res) => {
-  const allProducts = readData();
-  const products = allProducts.filter(p => !p.deletedAt);
-
-  const total = products.length;
-  const outOfStock = products.filter(p => p.status === 'Out of Stock').length;
-  const averageRating = total > 0 ? (products.reduce((acc, p) => acc + (p.rating || 0), 0) / total).toFixed(1) : 0;
-  
-  const brandCounts = products.reduce((acc, p) => {
-    const brand = p.metadata?.brand || 'Unknown';
-    acc[brand] = (acc[brand] || 0) + 1;
-    return acc;
-  }, {});
-
-  res.json({
-    totalProducts: total,
-    outOfStock,
-    averageRating: parseFloat(averageRating),
-    brandCounts
-  });
 });
 
 /**
@@ -446,25 +380,20 @@ app.get('/api/products/stats', (req, res) => {
  *                   items:
  *                     type: string
  */
-app.get('/api/products/options', (req, res) => {
-  const allProducts = readData();
-  const products = allProducts.filter(p => !p.deletedAt);
-  
-  const tags = new Set();
-  const brands = new Set();
-  const statuses = new Set();
+app.get('/api/products/options', async (req, res) => {
+  try {
+    const tagsRes = await pool.query('SELECT DISTINCT unnest(tags) as tag FROM products WHERE deleted_at IS NULL');
+    const brandsRes = await pool.query("SELECT DISTINCT metadata->>'brand' as brand FROM products WHERE deleted_at IS NULL");
+    const statusesRes = await pool.query('SELECT DISTINCT status FROM products WHERE deleted_at IS NULL');
+    
+    const tags = tagsRes.rows.map(r => r.tag).filter(Boolean);
+    const brands = brandsRes.rows.map(r => r.brand).filter(Boolean);
+    const statuses = statusesRes.rows.map(r => r.status).filter(Boolean);
 
-  products.forEach(p => {
-    if (p.tags) p.tags.forEach(t => tags.add(t));
-    if (p.metadata?.brand) brands.add(p.metadata.brand);
-    if (p.status) statuses.add(p.status);
-  });
-
-  res.json({
-    tags: Array.from(tags),
-    brands: Array.from(brands),
-    statuses: Array.from(statuses)
-  });
+    res.json({ tags, brands, statuses });
+  } catch (error) {
+    res.status(500).json({ message: 'Internal server error', error: error.message });
+  }
 });
 
 /**
@@ -495,24 +424,18 @@ app.get('/api/products/options', (req, res) => {
  *                 message:
  *                   type: string
  */
-app.delete('/api/products/batch', (req, res) => {
+app.delete('/api/products/batch', async (req, res) => {
   const { ids } = req.body;
   if (!Array.isArray(ids)) {
     return res.status(400).json({ message: 'ids array is required' });
   }
-
-  const products = readData();
-  let deletedCount = 0;
   
-  products.forEach(p => {
-    if (ids.includes(p.id) && !p.deletedAt) {
-      p.deletedAt = new Date().toISOString();
-      deletedCount++;
-    }
-  });
-  
-  writeData(products);
-  res.json({ message: `${deletedCount} products soft-deleted successfully` });
+  try {
+    const result = await pool.query('UPDATE products SET deleted_at = CURRENT_TIMESTAMP WHERE id = ANY($1) AND deleted_at IS NULL', [ids]);
+    res.json({ message: `${result.rowCount} products soft-deleted successfully` });
+  } catch (error) {
+    res.status(500).json({ message: 'Internal server error', error: error.message });
+  }
 });
 
 /**
@@ -593,97 +516,94 @@ app.delete('/api/products/batch', (req, res) => {
  *                 totalPages:
  *                   type: integer
  */
-app.get('/api/products', (req, res) => {
-  let products = readData();
-  
+app.get('/api/products', async (req, res) => {
   const { search, tag, status, brand, minPrice, maxPrice, includeDeleted, sortBy, order, page = 1, limit = 10 } = req.query;
 
-  // Filter soft-deleted
+  let queryParams = [];
+  let whereClauses = [];
+  
   if (includeDeleted !== 'true') {
-    products = products.filter(p => !p.deletedAt);
+    whereClauses.push('deleted_at IS NULL');
   }
 
-  // Filter
   if (search) {
-    const s = search.toLowerCase();
-    products = products.filter(p => p.name.toLowerCase().includes(s) || (p.desc && p.desc.toLowerCase().includes(s)));
+    queryParams.push(`%${search.toLowerCase()}%`);
+    whereClauses.push(`(LOWER(name) LIKE $${queryParams.length} OR LOWER("desc") LIKE $${queryParams.length})`);
   }
   if (tag) {
-    products = products.filter(p => p.tags && p.tags.includes(tag));
+    queryParams.push(tag);
+    whereClauses.push(`$${queryParams.length} = ANY(tags)`);
   }
   if (status) {
-    products = products.filter(p => p.status === status);
+    queryParams.push(status);
+    whereClauses.push(`status = $${queryParams.length}`);
   }
   if (brand) {
-    products = products.filter(p => p.metadata?.brand === brand);
+    queryParams.push(brand);
+    whereClauses.push(`metadata->>'brand' = $${queryParams.length}`);
   }
   if (minPrice) {
-    products = products.filter(p => p.price >= Number(minPrice));
+    queryParams.push(Number(minPrice));
+    whereClauses.push(`price >= $${queryParams.length}`);
   }
   if (maxPrice) {
-    products = products.filter(p => p.price <= Number(maxPrice));
+    queryParams.push(Number(maxPrice));
+    whereClauses.push(`price <= $${queryParams.length}`);
   }
 
-  // Sort
-  if (sortBy) {
-    const sortOrder = order === 'desc' ? -1 : 1;
-    products.sort((a, b) => {
-      let valA = a[sortBy];
-      let valB = b[sortBy];
-      if (typeof valA === 'string') valA = valA.toLowerCase();
-      if (typeof valB === 'string') valB = valB.toLowerCase();
-      
-      if (valA < valB) return -1 * sortOrder;
-      if (valA > valB) return 1 * sortOrder;
-      return 0;
+  const whereStr = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+  
+  let orderCol = 'created_at';
+  if (sortBy === 'price') orderCol = 'price';
+  else if (sortBy === 'rating') orderCol = 'rating';
+  else if (sortBy === 'name') orderCol = 'name';
+  
+  const sortDirection = order === 'asc' ? 'ASC' : 'DESC';
+  
+  try {
+    const countRes = await pool.query(`SELECT COUNT(*) FROM products ${whereStr}`, queryParams);
+    const total = parseInt(countRes.rows[0].count);
+    
+    const parsedPage = parseInt(page);
+    const parsedLimit = parseInt(limit);
+    const offset = (parsedPage - 1) * parsedLimit;
+    
+    const paginatedRes = await pool.query(`
+      SELECT * FROM products 
+      ${whereStr} 
+      ORDER BY ${orderCol} ${sortDirection} 
+      LIMIT ${parsedLimit} OFFSET ${offset}
+    `, queryParams);
+    
+    res.json({
+      data: paginatedRes.rows.map(r => ({
+        ...r,
+        desc: r.desc,
+        createdAt: r.created_at,
+        deletedAt: r.deleted_at,
+        isActive: r.is_active
+      })),
+      total,
+      page: parsedPage,
+      limit: parsedLimit,
+      totalPages: Math.ceil(total / parsedLimit)
     });
-  } else {
-    // Default sort by createdAt desc
-    products.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  } catch (error) {
+    res.status(500).json({ message: 'Internal server error', error: error.message });
   }
-
-  // Pagination
-  const total = products.length;
-  const startIndex = (Number(page) - 1) * Number(limit);
-  const endIndex = startIndex + Number(limit);
-  const paginatedProducts = products.slice(startIndex, endIndex);
-
-  res.json({
-    data: paginatedProducts,
-    total,
-    page: Number(page),
-    limit: Number(limit),
-    totalPages: Math.ceil(total / Number(limit))
-  });
 });
 
-/**
- * @swagger
- * /api/products/{id}:
- *   get:
- *     summary: Get a product by id
- *     tags: [Products]
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema:
- *           type: string
- *     responses:
- *       200:
- *         description: The product object
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Product'
- */
-app.get('/api/products/:id', (req, res) => {
-  const products = readData();
-  const product = products.find(p => p.id === req.params.id && !p.deletedAt);
-  if (product) {
-    res.json(product);
-  } else {
-    res.status(404).json({ message: 'Product not found or deleted' });
+app.get('/api/products/:id', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM products WHERE id = $1 AND deleted_at IS NULL', [req.params.id]);
+    if (result.rows.length > 0) {
+      const p = result.rows[0];
+      res.json({ ...p, desc: p.desc, createdAt: p.created_at, deletedAt: p.deleted_at, isActive: p.is_active });
+    } else {
+      res.status(404).json({ message: 'Product not found or deleted' });
+    }
+  } catch (error) {
+    res.status(500).json({ message: 'Internal server error', error: error.message });
   }
 });
 
@@ -709,24 +629,29 @@ app.get('/api/products/:id', (req, res) => {
  *               items:
  *                 $ref: '#/components/schemas/Product'
  */
-app.get('/api/products/:id/related', (req, res) => {
-  const products = readData();
-  const product = products.find(p => p.id === req.params.id && !p.deletedAt);
-  
-  if (!product) {
-    return res.status(404).json({ message: 'Product not found' });
+app.get('/api/products/:id/related', async (req, res) => {
+  try {
+    const prodRes = await pool.query('SELECT tags, metadata FROM products WHERE id = $1 AND deleted_at IS NULL', [req.params.id]);
+    if (prodRes.rows.length === 0) return res.status(404).json({ message: 'Product not found' });
+    
+    const product = prodRes.rows[0];
+    const brand = product.metadata?.brand;
+    const tags = product.tags || [];
+
+    let queryStr = `
+      SELECT * FROM products 
+      WHERE id != $1 AND deleted_at IS NULL AND (
+        metadata->>'brand' = $2 
+        OR tags && $3
+      )
+      LIMIT 5
+    `;
+    const result = await pool.query(queryStr, [req.params.id, brand, tags]);
+    
+    res.json(result.rows.map(p => ({ ...p, desc: p.desc, createdAt: p.created_at, deletedAt: p.deleted_at, isActive: p.is_active })));
+  } catch (error) {
+    res.status(500).json({ message: 'Internal server error', error: error.message });
   }
-
-  const related = products.filter(p => {
-    if (p.id === product.id || p.deletedAt) return false; 
-    
-    const hasCommonTag = product.tags && p.tags && product.tags.some(tag => p.tags.includes(tag));
-    const hasSameBrand = product.metadata?.brand && p.metadata?.brand === product.metadata.brand;
-    
-    return hasCommonTag || hasSameBrand;
-  });
-
-  res.json(related.slice(0, 5));
 });
 
 /**
@@ -751,13 +676,15 @@ app.get('/api/products/:id/related', (req, res) => {
  *               items:
  *                 $ref: '#/components/schemas/Review'
  */
-app.get('/api/products/:id/reviews', (req, res) => {
-  const products = readData();
-  const product = products.find(p => p.id === req.params.id && !p.deletedAt);
-  if (product) {
-    res.json(product.reviews || []);
-  } else {
-    res.status(404).json({ message: 'Product not found' });
+app.get('/api/products/:id/reviews', async (req, res) => {
+  try {
+    const prodRes = await pool.query('SELECT id FROM products WHERE id = $1 AND deleted_at IS NULL', [req.params.id]);
+    if (prodRes.rows.length === 0) return res.status(404).json({ message: 'Product not found' });
+    
+    const reviewsRes = await pool.query('SELECT * FROM reviews WHERE product_id = $1 ORDER BY created_at DESC', [req.params.id]);
+    res.json(reviewsRes.rows.map(r => ({ ...r, createdAt: r.created_at })));
+  } catch (error) {
+    res.status(500).json({ message: 'Internal server error', error: error.message });
   }
 });
 
@@ -799,39 +726,32 @@ app.get('/api/products/:id/reviews', (req, res) => {
  *               properties:
  *                 message:
  *                   type: string
- *                 product:
- *                   $ref: '#/components/schemas/Product'
+ *                 product_id:
+ *                   type: string
  */
-app.post('/api/products/:id/reviews', (req, res) => {
+app.post('/api/products/:id/reviews', async (req, res) => {
   const { user, rating, comment } = req.body;
   if (!user || rating == null || !comment || rating < 1 || rating > 5) {
     return res.status(400).json({ message: 'Invalid review payload. Rating must be 1-5.' });
   }
 
-  const products = readData();
-  const index = products.findIndex(p => p.id === req.params.id && !p.deletedAt);
-  
-  if (index !== -1) {
-    const product = products[index];
-    if (!product.reviews) product.reviews = [];
+  try {
+    const prodRes = await pool.query('SELECT id, rating FROM products WHERE id = $1 AND deleted_at IS NULL', [req.params.id]);
+    if (prodRes.rows.length === 0) return res.status(404).json({ message: 'Product not found' });
     
-    const newReview = {
-      id: randomUUID(),
-      user,
-      rating: Number(rating),
-      comment,
-      createdAt: new Date().toISOString()
-    };
-    
-    product.reviews.push(newReview);
-    
-    const totalRating = product.reviews.reduce((acc, curr) => acc + curr.rating, 0);
-    product.rating = parseFloat((totalRating / product.reviews.length).toFixed(1));
-    
-    writeData(products);
-    res.status(201).json({ message: 'Review added', product });
-  } else {
-    res.status(404).json({ message: 'Product not found' });
+    const reviewId = randomUUID();
+    await pool.query(
+      'INSERT INTO reviews (id, product_id, "user", rating, comment) VALUES ($1, $2, $3, $4, $5)',
+      [reviewId, req.params.id, user, rating, comment]
+    );
+
+    const avgRes = await pool.query('SELECT AVG(rating) as avg_rating FROM reviews WHERE product_id = $1', [req.params.id]);
+    const newRating = parseFloat(avgRes.rows[0].avg_rating).toFixed(1);
+    await pool.query('UPDATE products SET rating = $1 WHERE id = $2', [newRating, req.params.id]);
+
+    res.status(201).json({ message: 'Review added', product_id: req.params.id });
+  } catch (error) {
+    res.status(500).json({ message: 'Internal server error', error: error.message });
   }
 });
 
@@ -857,23 +777,20 @@ app.post('/api/products/:id/reviews', (req, res) => {
  *               properties:
  *                 message:
  *                   type: string
- *                 product:
- *                   $ref: '#/components/schemas/Product'
  */
-app.post('/api/products/:id/restore', (req, res) => {
-  const products = readData();
-  const product = products.find(p => p.id === req.params.id);
-  
-  if (product) {
-    if (product.deletedAt) {
-      delete product.deletedAt;
-      writeData(products);
-      res.json({ message: 'Product restored successfully', product });
+app.post('/api/products/:id/restore', async (req, res) => {
+  try {
+    const prodRes = await pool.query('SELECT deleted_at FROM products WHERE id = $1', [req.params.id]);
+    if (prodRes.rows.length === 0) return res.status(404).json({ message: 'Product not found' });
+    
+    if (prodRes.rows[0].deleted_at) {
+      await pool.query('UPDATE products SET deleted_at = NULL WHERE id = $1', [req.params.id]);
+      res.json({ message: 'Product restored successfully' });
     } else {
-      res.json({ message: 'Product is not deleted', product });
+      res.json({ message: 'Product is not deleted' });
     }
-  } else {
-    res.status(404).json({ message: 'Product not found' });
+  } catch (error) {
+    res.status(500).json({ message: 'Internal server error', error: error.message });
   }
 });
 
@@ -897,17 +814,21 @@ app.post('/api/products/:id/restore', (req, res) => {
  *             schema:
  *               $ref: '#/components/schemas/Product'
  */
-app.post('/api/products', (req, res) => {
-  const products = readData();
-  const newProduct = {
-    id: randomUUID(),
-    ...req.body,
-    createdAt: new Date().toISOString(),
-    reviews: []
-  };
-  products.push(newProduct);
-  writeData(products);
-  res.status(201).json(newProduct);
+app.post('/api/products', async (req, res) => {
+  try {
+    const newId = randomUUID();
+    const { name, desc, price, tags, status, isActive, metadata } = req.body;
+    await pool.query(
+      `INSERT INTO products (id, name, "desc", price, tags, status, is_active, metadata) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [newId, name, desc, price, tags || [], status, isActive, metadata || {}]
+    );
+    const result = await pool.query('SELECT * FROM products WHERE id = $1', [newId]);
+    const p = result.rows[0];
+    res.status(201).json({ ...p, desc: p.desc, createdAt: p.created_at, isActive: p.is_active });
+  } catch (error) {
+    res.status(500).json({ message: 'Internal server error', error: error.message });
+  }
 });
 
 /**
@@ -936,17 +857,23 @@ app.post('/api/products', (req, res) => {
  *             schema:
  *               $ref: '#/components/schemas/Product'
  */
-app.put('/api/products/:id', (req, res) => {
-  const products = readData();
-  const index = products.findIndex(p => p.id === req.params.id && !p.deletedAt);
-  
-  if (index !== -1) {
-    const updatedProduct = { ...req.body, id: req.params.id, reviews: products[index].reviews }; 
-    products[index] = updatedProduct;
-    writeData(products);
-    res.json(updatedProduct);
-  } else {
-    res.status(404).json({ message: 'Product not found' });
+app.put('/api/products/:id', async (req, res) => {
+  try {
+    const { name, desc, price, tags, status, isActive, metadata } = req.body;
+    const result = await pool.query(
+      `UPDATE products 
+       SET name = $1, "desc" = $2, price = $3, tags = $4, status = $5, is_active = $6, metadata = $7
+       WHERE id = $8 AND deleted_at IS NULL RETURNING *`,
+      [name, desc, price, tags || [], status, isActive, metadata || {}, req.params.id]
+    );
+    if (result.rows.length > 0) {
+      const p = result.rows[0];
+      res.json({ ...p, desc: p.desc, createdAt: p.created_at, isActive: p.is_active });
+    } else {
+      res.status(404).json({ message: 'Product not found' });
+    }
+  } catch (error) {
+    res.status(500).json({ message: 'Internal server error', error: error.message });
   }
 });
 
@@ -976,17 +903,32 @@ app.put('/api/products/:id', (req, res) => {
  *             schema:
  *               $ref: '#/components/schemas/Product'
  */
-app.patch('/api/products/:id', (req, res) => {
-  const products = readData();
-  const index = products.findIndex(p => p.id === req.params.id && !p.deletedAt);
-  
-  if (index !== -1) {
-    const updatedProduct = { ...products[index], ...req.body, id: req.params.id };
-    products[index] = updatedProduct;
-    writeData(products);
-    res.json(updatedProduct);
-  } else {
-    res.status(404).json({ message: 'Product not found' });
+app.patch('/api/products/:id', async (req, res) => {
+  try {
+    const prodRes = await pool.query('SELECT * FROM products WHERE id = $1 AND deleted_at IS NULL', [req.params.id]);
+    if (prodRes.rows.length === 0) return res.status(404).json({ message: 'Product not found' });
+    
+    const existing = prodRes.rows[0];
+    const update = {
+      name: req.body.name !== undefined ? req.body.name : existing.name,
+      desc: req.body.desc !== undefined ? req.body.desc : existing.desc,
+      price: req.body.price !== undefined ? req.body.price : existing.price,
+      tags: req.body.tags !== undefined ? req.body.tags : existing.tags,
+      status: req.body.status !== undefined ? req.body.status : existing.status,
+      isActive: req.body.isActive !== undefined ? req.body.isActive : existing.is_active,
+      metadata: req.body.metadata !== undefined ? req.body.metadata : existing.metadata,
+    };
+    
+    const result = await pool.query(
+      `UPDATE products 
+       SET name = $1, "desc" = $2, price = $3, tags = $4, status = $5, is_active = $6, metadata = $7
+       WHERE id = $8 RETURNING *`,
+      [update.name, update.desc, update.price, update.tags || [], update.status, update.isActive, update.metadata || {}, req.params.id]
+    );
+    const p = result.rows[0];
+    res.json({ ...p, desc: p.desc, createdAt: p.created_at, isActive: p.is_active });
+  } catch (error) {
+    res.status(500).json({ message: 'Internal server error', error: error.message });
   }
 });
 
@@ -1013,16 +955,16 @@ app.patch('/api/products/:id', (req, res) => {
  *                 message:
  *                   type: string
  */
-app.delete('/api/products/:id', (req, res) => {
-  const products = readData();
-  const product = products.find(p => p.id === req.params.id);
-  
-  if (product && !product.deletedAt) {
-    product.deletedAt = new Date().toISOString();
-    writeData(products);
-    res.json({ message: 'Product soft-deleted successfully' });
-  } else {
-    res.status(404).json({ message: 'Product not found or already deleted' });
+app.delete('/api/products/:id', async (req, res) => {
+  try {
+    const result = await pool.query('UPDATE products SET deleted_at = CURRENT_TIMESTAMP WHERE id = $1 AND deleted_at IS NULL', [req.params.id]);
+    if (result.rowCount > 0) {
+      res.json({ message: 'Product soft-deleted successfully' });
+    } else {
+      res.status(404).json({ message: 'Product not found or already deleted' });
+    }
+  } catch (error) {
+    res.status(500).json({ message: 'Internal server error', error: error.message });
   }
 });
 
