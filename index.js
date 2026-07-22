@@ -170,7 +170,7 @@ app.post('/api/auth/login', (req, res) => {
   const user = users.find(u => u.username === username && u.password === password);
 
   if (user) {
-    const accessToken = jwt.sign({ username: user.username }, SECRET_KEY, { expiresIn: '15m' });
+    const accessToken = jwt.sign({ username: user.username }, SECRET_KEY, { expiresIn: '1d' });
     const refreshToken = jwt.sign({ username: user.username }, REFRESH_SECRET_KEY, { expiresIn: '7d' });
     refreshTokens.push(refreshToken);
     res.json({ accessToken, refreshToken });
@@ -222,7 +222,7 @@ app.post('/api/auth/refresh', (req, res) => {
     if (err) return res.status(403).json({ message: 'Invalid or expired refresh token' });
 
     refreshTokens = refreshTokens.filter(t => t !== token);
-    const newAccessToken = jwt.sign({ username: user.username }, SECRET_KEY, { expiresIn: '15m' });
+    const newAccessToken = jwt.sign({ username: user.username }, SECRET_KEY, { expiresIn: '1d' });
     const newRefreshToken = jwt.sign({ username: user.username }, REFRESH_SECRET_KEY, { expiresIn: '7d' });
     refreshTokens.push(newRefreshToken);
 
