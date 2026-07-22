@@ -88,7 +88,7 @@ const authenticateToken = (req, res, next) => {
   if (!token) return res.status(401).json({ message: 'Access token required' });
 
   jwt.verify(token, SECRET_KEY, (err, user) => {
-    if (err) return res.status(403).json({ message: 'Invalid or expired token' });
+    if (err) return res.status(401).json({ message: 'Invalid or expired token' });
     req.user = user;
     next();
   });
