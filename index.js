@@ -531,8 +531,9 @@ app.get('/api/products', async (req, res) => {
     whereClauses.push(`(LOWER(name) LIKE $${queryParams.length} OR LOWER("desc") LIKE $${queryParams.length})`);
   }
   if (tag) {
-    queryParams.push(tag);
-    whereClauses.push(`$${queryParams.length} = ANY(tags)`);
+    const tagsArray = Array.isArray(tag) ? tag : [tag];
+    queryParams.push(tagsArray);
+    whereClauses.push(`tags && $${queryParams.length}`);
   }
   if (status) {
     queryParams.push(status);
