@@ -521,7 +521,8 @@ app.delete('/api/products/batch', async (req, res) => {
  *                   type: integer
  */
 app.get('/api/products', async (req, res) => {
-  const { search, tag, status, brand, minPrice, maxPrice, includeDeleted, sortBy, order, page = 1, limit = 10 } = req.query;
+  const { search, status, brand, minPrice, maxPrice, includeDeleted, sortBy, order, page = 1, limit = 10 } = req.query;
+  const tag = req.query.tag || req.query['tag[]'];
 
   let queryParams = [];
   let whereClauses = [];
