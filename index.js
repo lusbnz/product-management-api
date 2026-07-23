@@ -452,7 +452,11 @@ app.delete('/api/products/batch', async (req, res) => {
  *       - in: query
  *         name: tag
  *         schema:
- *           type: string
+ *           type: array
+ *           items:
+ *             type: string
+ *         style: form
+ *         explode: true
  *       - in: query
  *         name: status
  *         schema:
